@@ -9,6 +9,7 @@ from app.schemas import TokenResponse, TokenRefreshRequest, UserInfo, UserCreate
 from app.security import verify_password, hash_password
 from app.middleware.rate_limiter import limiter
 from app.validators.sanitizer import sanitize_text, contains_sql_patterns
+from datetime import datetime, timezone
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -18,17 +19,16 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(User.username == user_data.username).first()
     if existing_user:
         raise HTTPException(status_code=409, detail=f"User '{user_data.username}' already exists")
-
-    existing_email = db.query(User).filter(User.email == user_data.email).first()
-    if existing_email:
-        raise HTTPException(status_code=409, detail=f"Email '{user_data.email}' already registered")
-
+    existing_email = db.query(User).filter(User._encrypted_email != None).all()
+    for u in existing_email:
+        if u.email == user_data.email:
+            raise HTTPException(status_code=409, detail=f"Email already registered")
     new_user = User(
         username=user_data.username,
-        email=user_data.email,
         full_name=user_data.full_name,
         password_hash=hash_password(user_data.password),
     )
+    new_user.email = user_data.email
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -38,12 +38,23 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 @router.post("/login", response_model=TokenResponse)
 @limiter.limit("5/minute")
 async def login(request: Request, username: str, password: str, db: Session = Depends(get_db)):
+    from app.audit.logger import log_login_success, log_login_failed
+    from app.audit.detector import check_brute_force, check_off_hours_access
+
+    ip = request.client.host if request.client else "unknown"
+
+    if check_brute_force(db, ip):
+        log_login_failed(db, username, ip, "brute_force_blocked")
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Try later.")
+
     user = db.query(User).filter(User.username == username).first()
     if not user or not verify_password(password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password",
-        )
+        log_login_failed(db, username, ip)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+
+    check_off_hours_access(db, user.id, user.username, ip, datetime.now(timezone.utc).hour)
+    log_login_success(db, user.id, user.username, ip)
+
     role = user.roles[0].name if user.roles else "student"
     access_token = create_access_token(user.id, role)
     refresh_token = create_refresh_token(user.id)
@@ -56,15 +67,12 @@ def refresh(body: TokenRefreshRequest, db: Session = Depends(get_db)):
         payload = verify_token(body.refresh_token)
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
-
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token required")
-
     user_id = int(payload["sub"])
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     role = user.roles[0].name if user.roles else "student"
     return TokenResponse(
         access_token=create_access_token(user_id, role),
@@ -87,9 +95,6 @@ def get_me(current_user: User = Depends(get_current_user)):
 @router.post("/demo/comment")
 def demo_comment(comment: CommentCreate):
     if contains_sql_patterns(comment.text):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="SQL patterns detected"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="SQL patterns detected")
     clean_text = sanitize_text(comment.text)
     return {"original": comment.text, "sanitized": clean_text}
