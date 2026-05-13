@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+*.md
+data/
+nginx/certs/
+bandit_report.json
+__pycache__
+*.pyc
